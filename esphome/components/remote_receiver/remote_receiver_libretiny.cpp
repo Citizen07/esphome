@@ -30,6 +30,17 @@ void IRAM_ATTR HOT RemoteReceiverComponentStore::gpio_intr(RemoteReceiverCompone
   if (time_since_change <= arg->filter_us)
     return;
   if (time_since_change >= arg->idle_us) {
+    // Check if we received a consecutive idle signal which was not processed yet.
+    if (arg->buffer_idle_at == arg->buffer_write_at && arg->buffer_read_at != arg->buffer_idle_at) {
+      const uint32_t prev_write_at = (arg->buffer_size + arg->buffer_write_at - 1) % arg->buffer_size;
+      // Remove the previous idle signal if it was a consecutive and even it was not processed.
+      if (last_change - arg->buffer[prev_write_at] >= arg->idle_us && prev_write_at != arg->buffer_read_at) {
+        arg->buffer_write_at = prev_write_at;
+        arg->buffer_idle_at = prev_write_at;
+        arg->buffer[prev_write_at] = now;
+        return;
+      }
+    }
     arg->buffer_idle_at = next;
   }
 
