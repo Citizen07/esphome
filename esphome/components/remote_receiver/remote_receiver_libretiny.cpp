@@ -174,7 +174,7 @@ void RemoteReceiverComponent::loop() {
   }
 
   if (this->temp_.size() <= 1)
-    this->temp_.erase();
+    this->temp_.clear();
   else
     this->temp_.push_back(this->idle_us_ * multiplier);
 
