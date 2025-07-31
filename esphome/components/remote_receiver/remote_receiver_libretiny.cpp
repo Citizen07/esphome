@@ -172,7 +172,11 @@ void RemoteReceiverComponent::loop() {
     read_at = (read_at + 1) % s.buffer_size;
     multiplier *= -1;
   }
-  this->temp_.push_back(this->idle_us_ * multiplier);
+
+  if (this->temp_.size() <= 1)
+    this->temp_.erase();
+  else
+    this->temp_.push_back(this->idle_us_ * multiplier);
 
   if (s.overflow) {
     ESP_LOGVV(TAG, "Remote receiver buffer overflow! write_at=%u idle_at=%u read_at=%u", s.buffer_write_at,
