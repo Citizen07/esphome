@@ -12,20 +12,61 @@ static const char *const TAG = "remote_receiver.esp8266";
 
 void IRAM_ATTR HOT RemoteReceiverComponentStore::gpio_intr(RemoteReceiverComponentStore *arg) {
   const uint32_t now = micros();
-  // If the lhs is 1 (rising edge) we should write to an uneven index and vice versa
   const uint32_t next = (arg->buffer_write_at + 1) % arg->buffer_size;
+
+  // If the lhs is 1 (rising edge) we should write to an uneven index and vice versa
   const bool level = arg->pin.digital_read();
   if (level != next % 2)
     return;
 
-  // If next is buffer_read, we have hit an overflow
-  if (next == arg->buffer_read_at)
+  // If next is buffer_read_at, we have hit an overflow
+  if (next == arg->buffer_read_at) {
+    arg->overflow = true;
+    // Reset the write_at to the last good idle position corresponding to signal level,
+    // droping some data since it's is already corrupted
+    if (arg->buffer_write_at != arg->buffer_idle_at) {
+      if (level == arg->buffer_idle_at % 2) {
+        arg->buffer_write_at = arg->buffer_idle_at;
+      } else {
+        arg->buffer_write_at = (arg->buffer_idle_at + 1) % arg->buffer_size;
+      }
+    }
+    arg->buffer[arg->buffer_write_at] = now;
     return;
+  }
 
   const uint32_t last_change = arg->buffer[arg->buffer_write_at];
   const uint32_t time_since_change = now - last_change;
-  if (time_since_change <= arg->filter_us)
+  const uint32_t prev = (arg->buffer_size + arg->buffer_write_at - 1) % arg->buffer_size;
+
+  if (time_since_change >= arg->idle_us) {
+    // Handle idle state
+    arg->overflow = false;
+
+    const uint32_t prev_delta = last_change - arg->buffer[prev];
+    if (prev_delta <= arg->filter_us && prev_delta != 0 && arg->buffer[prev] != 0) {
+      // If delta of the previous change is less than filter_us, we can just update the previous value
+      arg->buffer_write_at = prev;
+      arg->buffer[arg->buffer_write_at] = now;
+      arg->buffer_idle_at = prev;
+      return;
+    }
+
+    arg->buffer_idle_at = next;
+  } else if (arg->overflow) {
+    // Handle overflow condition by updating the time
+    if (level == arg->buffer_idle_at % 2) {
+      arg->buffer_write_at = arg->buffer_idle_at;
+    } else {
+      arg->buffer_write_at = (arg->buffer_idle_at + 1) % arg->buffer_size;
+    }
+    arg->buffer[arg->buffer_write_at] = now;
     return;
+  } else if (time_since_change <= arg->filter_us && arg->buffer_write_at != arg->buffer_idle_at) {
+    // Remove short pulse from the buffer
+    arg->buffer_write_at = prev;
+    return;
+  }
 
   arg->buffer[arg->buffer_write_at = next] = now;  // NOLINT(clang-diagnostic-deprecated-volatile)
 }
@@ -34,6 +75,7 @@ void RemoteReceiverComponent::setup() {
   this->pin_->setup();
   auto &s = this->store_;
   s.filter_us = this->filter_us_;
+  s.idle_us = this->idle_us_;
   s.pin = this->pin_->to_isr();
   s.buffer_size = this->buffer_size_;
 
@@ -49,9 +91,9 @@ void RemoteReceiverComponent::setup() {
 
   // First index is a space.
   if (this->pin_->digital_read()) {
-    s.buffer_write_at = s.buffer_read_at = 1;
+    s.buffer_write_at = s.buffer_read_at = s.buffer_idle_at = 1;
   } else {
-    s.buffer_write_at = s.buffer_read_at = 0;
+    s.buffer_write_at = s.buffer_read_at = s.buffer_idle_at = 0;
   }
   this->pin_->attach_interrupt(RemoteReceiverComponentStore::gpio_intr, &this->store_, gpio::INTERRUPT_ANY_EDGE);
 }
@@ -77,43 +119,63 @@ void RemoteReceiverComponent::loop() {
 
   // copy write at to local variables, as it's volatile
   const uint32_t write_at = s.buffer_write_at;
-  const uint32_t dist = (s.buffer_size + write_at - s.buffer_read_at) % s.buffer_size;
+  const uint32_t idle_at = s.buffer_idle_at;
+  const uint32_t dist = (s.buffer_size + idle_at - s.buffer_read_at) % s.buffer_size;
   // signals must at least one rising and one leading edge
   if (dist <= 1)
     return;
-  const uint32_t now = micros();
-  if (now - s.buffer[write_at] < this->idle_us_) {
-    // The last change was fewer than the configured idle time ago.
-    return;
-  }
 
-  ESP_LOGVV(TAG, "read_at=%u write_at=%u dist=%u now=%u end=%u", s.buffer_read_at, write_at, dist, now,
-            s.buffer[write_at]);
+  const uint32_t now = micros();
+  ESP_LOGVV(TAG, "read_at=%u idle_at=%u dist=%u now_us=%u end_us=%u", s.buffer_read_at, idle_at, dist, now,
+            s.buffer[idle_at]);
 
   // Skip first value, it's from the previous idle level
+  uint32_t pre_prev = s.buffer_read_at;
   s.buffer_read_at = (s.buffer_read_at + 1) % s.buffer_size;
   uint32_t prev = s.buffer_read_at;
-  s.buffer_read_at = (s.buffer_read_at + 1) % s.buffer_size;
-  const uint32_t reserve_size = 1 + (s.buffer_size + write_at - s.buffer_read_at) % s.buffer_size;
+  uint32_t read_at = (s.buffer_read_at + 1) % s.buffer_size;
+  const uint32_t reserve_size = 1 + (s.buffer_size + idle_at - read_at) % s.buffer_size;
   this->temp_.clear();
   this->temp_.reserve(reserve_size);
-  int32_t multiplier = s.buffer_read_at % 2 == 0 ? 1 : -1;
+  int32_t multiplier = read_at % 2 == 0 ? 1 : -1;
 
-  for (uint32_t i = 0; prev != write_at; i++) {
-    int32_t delta = s.buffer[s.buffer_read_at] - s.buffer[prev];
+  for (uint32_t i = 0; prev != idle_at; i++) {
+    int32_t delta = s.buffer[read_at] - s.buffer[prev];
     if (uint32_t(delta) >= this->idle_us_) {
-      // already found a space longer than idle. There must have been two pulses
+      if (this->temp_.empty() && read_at != idle_at) {
+        pre_prev = prev;
+        prev = s.buffer_read_at = read_at;
+        read_at = (read_at + 1) % s.buffer_size;
+        multiplier *= -1;
+        i = 0;
+        continue;
+      }
+
+      // already found a space longer than idle. There must have been more than one pulse
       break;
     }
 
-    ESP_LOGVV(TAG, "  i=%u buffer[%u]=%u - buffer[%u]=%u -> %d", i, s.buffer_read_at, s.buffer[s.buffer_read_at], prev,
-              s.buffer[prev], multiplier * delta);
+    if (this->temp_.empty()) {
+      ESP_LOGVV(TAG, "  idle buffer[%u]=%u - buffer[%u]=%u -> %d", prev, s.buffer[prev], pre_prev, s.buffer[pre_prev],
+                (prev % 2 == 0 ? 1 : -1) * (s.buffer[prev] - s.buffer[pre_prev]));
+    }
+
+    ESP_LOGVV(TAG, "  i=%u buffer[%u]=%u - buffer[%u]=%u -> %d", i, read_at, s.buffer[read_at], prev, s.buffer[prev],
+              multiplier * delta);
     this->temp_.push_back(multiplier * delta);
-    prev = s.buffer_read_at;
-    s.buffer_read_at = (s.buffer_read_at + 1) % s.buffer_size;
+    prev = s.buffer_read_at = read_at;
+    read_at = (read_at + 1) % s.buffer_size;
     multiplier *= -1;
   }
-  s.buffer_read_at = (s.buffer_size + s.buffer_read_at - 1) % s.buffer_size;
+
+  if (s.overflow) {
+    ESP_LOGVV(TAG, "Remote receiver buffer overflow! write_at=%u idle_at=%u read_at=%u", s.buffer_write_at,
+              s.buffer_idle_at, s.buffer_read_at);
+  }
+
+  if (this->temp_.empty())
+    return;
+
   this->temp_.push_back(this->idle_us_ * multiplier);
 
   this->call_listeners_dumpers_();
