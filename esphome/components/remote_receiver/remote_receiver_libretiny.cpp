@@ -142,7 +142,7 @@ void RemoteReceiverComponent::loop() {
   for (uint32_t i = 0; prev != idle_at; i++) {
     int32_t delta = s.buffer[read_at] - s.buffer[prev];
     if (uint32_t(delta) >= this->idle_us_) {
-      if (this->temp_.size() == 1) {
+      if (this->temp_.size() == 1 || this->temp_.size() == 2) {
         // signals must at least one rising and one leading edge
         this->temp_.clear();
       }
@@ -173,7 +173,7 @@ void RemoteReceiverComponent::loop() {
     multiplier *= -1;
   }
 
-  if (this->temp_.size() <= 1)
+  if (this->temp_.size() <= 2)
     this->temp_.clear();
   else
     this->temp_.push_back(this->idle_us_ * multiplier);
