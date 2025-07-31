@@ -22,11 +22,14 @@ struct RemoteReceiverComponentStore {
   volatile uint32_t *buffer{nullptr};
   /// The position last written to
   volatile uint32_t buffer_write_at;
+  /// The position of idle
+  volatile uint32_t buffer_idle_at;
   /// The position last read from
   uint32_t buffer_read_at{0};
-  bool overflow{false};
+  volatile bool overflow{false};
   uint32_t buffer_size{1000};
   uint32_t filter_us{10};
+  uint32_t idle_us{10000};
   ISRInternalGPIOPin pin;
 };
 #elif defined(USE_ESP32)
