@@ -126,11 +126,6 @@ void RemoteReceiverComponent::loop() {
   const uint32_t write_at = s.buffer_write_at;
   const uint32_t idle_at =
       (now - s.buffer[write_at] >= this->idle_us_) ? ((write_at + 1) % s.buffer_size) : s.buffer_idle_at;
-  if (now - s.buffer[write_at] >= this->idle_us_) {
-    // No more data received after last write
-    idle_at = (write_at + 1) % s.buffer_size;
-  }
-
   const uint32_t dist = (s.buffer_size + idle_at - s.buffer_read_at) % s.buffer_size;
   // signals must at least one rising and one leading edge
   if (dist <= 1)
