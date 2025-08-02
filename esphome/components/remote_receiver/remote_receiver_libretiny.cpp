@@ -149,17 +149,17 @@ void RemoteReceiverComponent::loop() {
 
   for (uint32_t i = 0; s.buffer_read_at != idle_at; i++) {
     int32_t delta = s.buffer[read_at] - s.buffer[s.buffer_read_at];
+    if (uint32_t(delta) >= this->idle_us_) {
+      // already found a space longer than idle. There must have been more than one pulse
+      break;
+    }
+
     ESP_LOGVV(TAG, "  i=%u buffer[%u]=%u - buffer[%u]=%u -> %d", i, read_at, s.buffer[read_at], s.buffer_read_at,
               s.buffer[s.buffer_read_at], multiplier * delta);
     this->temp_.push_back(multiplier * delta);
     s.buffer_read_at = read_at;
     read_at = (read_at + 1) % s.buffer_size;
     multiplier *= -1;
-
-    if (uint32_t(delta) >= this->idle_us_) {
-      // already found a space longer than idle. There must have been more than one pulse
-      break;
-    }
   }
 
   if (s.overflow) {
