@@ -132,52 +132,40 @@ void RemoteReceiverComponent::loop() {
   ESP_LOGVV(TAG, "read_at=%u idle_at=%u dist=%u now_us=%u end_us=%u", s.buffer_read_at, idle_at, dist, now,
             s.buffer[idle_at]);
 
-  // Skip first value, it's from the previous idle level
-  uint32_t idle_start = s.buffer_read_at;
-  s.buffer_read_at = (s.buffer_read_at + 1) % s.buffer_size;
-  uint32_t prev = s.buffer_read_at;
+  // Skip all consecutive idle pulses
   uint32_t read_at = (s.buffer_read_at + 1) % s.buffer_size;
+  while ((s.buffer[read_at] - s.buffer[s.buffer_read_at]) >= this->idle_us_) {
+    if (read_at == idle_at)
+      return;  // No more data to read
+
+    s.buffer_read_at = read_at;
+    read_at = (read_at + 1) % s.buffer_size;
+  }
+
   const uint32_t reserve_size = 1 + (s.buffer_size + idle_at - read_at) % s.buffer_size;
   this->temp_.clear();
   this->temp_.reserve(reserve_size);
   int32_t multiplier = read_at % 2 == 0 ? 1 : -1;
 
-  for (uint32_t i = 0; prev != idle_at; i++) {
-    int32_t delta = s.buffer[read_at] - s.buffer[prev];
-    if (uint32_t(delta) >= this->idle_us_) {
-      if (this->temp_.empty() && read_at != idle_at) {
-        idle_start = prev;
-        prev = s.buffer_read_at = read_at;
-        read_at = (read_at + 1) % s.buffer_size;
-        multiplier *= -1;
-        continue;
-      }
+  for (uint32_t i = 0; s.buffer_read_at != idle_at; i++) {
+    int32_t delta = s.buffer[read_at] - s.buffer[s.buffer_read_at];
+    ESP_LOGVV(TAG, "  i=%u buffer[%u]=%u - buffer[%u]=%u -> %d", i, read_at, s.buffer[read_at], s.buffer_read_at,
+              s.buffer[s.buffer_read_at], multiplier * delta);
+    this->temp_.push_back(multiplier * delta);
+    s.buffer_read_at = read_at;
+    read_at = (read_at + 1) % s.buffer_size;
+    multiplier *= -1;
 
+    if (uint32_t(delta) >= this->idle_us_) {
       // already found a space longer than idle. There must have been more than one pulse
       break;
     }
-
-    if (this->temp_.empty()) {
-      i = 0;
-      ESP_LOGVV(TAG, "  idle buffer[%u]=%u - buffer[%u]=%u -> %d", prev, s.buffer[prev], idle_start,
-                s.buffer[idle_start], (prev % 2 == 0 ? 1 : -1) * (s.buffer[prev] - s.buffer[idle_start]));
-    }
-
-    ESP_LOGVV(TAG, "  i=%u buffer[%u]=%u - buffer[%u]=%u -> %d", i, read_at, s.buffer[read_at], prev, s.buffer[prev],
-              multiplier * delta);
-    this->temp_.push_back(multiplier * delta);
-    prev = s.buffer_read_at = read_at;
-    read_at = (read_at + 1) % s.buffer_size;
-    multiplier *= -1;
   }
 
   if (s.overflow) {
     ESP_LOGVV(TAG, "Remote receiver buffer overflow! write_at=%u idle_at=%u read_at=%u", s.buffer_write_at,
               s.buffer_idle_at, s.buffer_read_at);
   }
-
-  if (this->temp_.empty())
-    return;
 
   this->temp_.push_back(this->idle_us_ * multiplier);
 
