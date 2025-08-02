@@ -91,9 +91,13 @@ void RemoteReceiverComponent::setup() {
 
   // First index is a space.
   if (this->pin_->digital_read()) {
-    s.buffer_write_at = s.buffer_read_at = s.buffer_idle_at = 1;
+    s.buffer_write_at = 1;
+    s.buffer_idle_at = 1;
+    s.buffer_read_at = 1;
   } else {
-    s.buffer_write_at = s.buffer_read_at = s.buffer_idle_at = 0;
+    s.buffer_write_at = 0;
+    s.buffer_idle_at = 0;
+    s.buffer_read_at = 0;
   }
   this->pin_->attach_interrupt(RemoteReceiverComponentStore::gpio_intr, &this->store_, gpio::INTERRUPT_ANY_EDGE);
 }
@@ -118,7 +122,6 @@ void RemoteReceiverComponent::loop() {
   auto &s = this->store_;
 
   // copy write at to local variables, as it's volatile
-  const uint32_t write_at = s.buffer_write_at;
   const uint32_t idle_at = s.buffer_idle_at;
   const uint32_t dist = (s.buffer_size + idle_at - s.buffer_read_at) % s.buffer_size;
   // signals must at least one rising and one leading edge
@@ -130,7 +133,7 @@ void RemoteReceiverComponent::loop() {
             s.buffer[idle_at]);
 
   // Skip first value, it's from the previous idle level
-  uint32_t pre_prev = s.buffer_read_at;
+  uint32_t idle_start = s.buffer_read_at;
   s.buffer_read_at = (s.buffer_read_at + 1) % s.buffer_size;
   uint32_t prev = s.buffer_read_at;
   uint32_t read_at = (s.buffer_read_at + 1) % s.buffer_size;
@@ -143,11 +146,10 @@ void RemoteReceiverComponent::loop() {
     int32_t delta = s.buffer[read_at] - s.buffer[prev];
     if (uint32_t(delta) >= this->idle_us_) {
       if (this->temp_.empty() && read_at != idle_at) {
-        pre_prev = prev;
+        idle_start = prev;
         prev = s.buffer_read_at = read_at;
         read_at = (read_at + 1) % s.buffer_size;
         multiplier *= -1;
-        i = 0;
         continue;
       }
 
@@ -156,8 +158,9 @@ void RemoteReceiverComponent::loop() {
     }
 
     if (this->temp_.empty()) {
-      ESP_LOGVV(TAG, "  idle buffer[%u]=%u - buffer[%u]=%u -> %d", prev, s.buffer[prev], pre_prev, s.buffer[pre_prev],
-                (prev % 2 == 0 ? 1 : -1) * (s.buffer[prev] - s.buffer[pre_prev]));
+      i = 0;
+      ESP_LOGVV(TAG, "  idle buffer[%u]=%u - buffer[%u]=%u -> %d", prev, s.buffer[prev], idle_start,
+                s.buffer[idle_start], (prev % 2 == 0 ? 1 : -1) * (s.buffer[prev] - s.buffer[idle_start]));
     }
 
     ESP_LOGVV(TAG, "  i=%u buffer[%u]=%u - buffer[%u]=%u -> %d", i, read_at, s.buffer[read_at], prev, s.buffer[prev],
