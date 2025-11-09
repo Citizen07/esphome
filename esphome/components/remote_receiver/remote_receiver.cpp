@@ -11,57 +11,52 @@ namespace remote_receiver {
 static const char *const TAG = "remote_receiver";
 
 void IRAM_ATTR HOT RemoteReceiverComponentStore::gpio_intr(RemoteReceiverComponentStore *arg) {
-  const uint32_t now = micros();
-  // If the lhs is 1 (rising edge) we should write to an uneven index and vice versa
-  const uint32_t next = (arg->buffer_write_at + 1) % arg->buffer_size;
-  const bool level = arg->pin.digital_read();
-  if (level != next % 2)
-    return;
+  const bool curr_level = arg->pin.digital_read();
+  const uint32_t curr_micros = micros();
+  const bool prev_level = arg->prev_level;
+  const uint32_t prev_micros = arg->prev_micros;
 
-  // If next is buffer_read, we have hit an overflow
-  if (next == arg->buffer_read_at)
-    return;
+  arg->prev_micros = curr_micros;
+  arg->prev_level = curr_level;
 
-  const uint32_t last_change = arg->buffer[arg->buffer_write_at];
-  const uint32_t time_since_change = now - last_change;
-  if (time_since_change <= arg->filter_us)
+  // filter out short pulses or if the level is the same
+  if (curr_micros - prev_micros < arg->filter_us || prev_level == curr_level) {
     return;
+  }
 
-  arg->buffer[arg->buffer_write_at = next] = now;  // NOLINT(clang-diagnostic-deprecated-volatile)
+  // commit if prev level is different from last level in the buffer
+  uint32_t buffer_write_at = arg->buffer_write_at + 1;
+  if (buffer_write_at >= arg->buffer_size) {
+    buffer_write_at = 0;
+  }
+  if (prev_level == buffer_write_at % 2) {
+    arg->buffer[buffer_write_at] = prev_micros;
+    arg->buffer_write_at = buffer_write_at;
+  }
 }
 
 void RemoteReceiverComponent::setup() {
   this->pin_->setup();
+
+  uint32_t curr_micros = micros();
+  bool curr_level = this->pin_->digital_read();
   auto &s = this->store_;
   s.filter_us = this->filter_us_;
   s.pin = this->pin_->to_isr();
-  s.buffer_size = this->buffer_size_;
-
-  this->high_freq_.start();
-  if (s.buffer_size % 2 != 0) {
-    // Make sure divisible by two. This way, we know that every 0bxxx0 index is a space and every 0bxxx1 index is a mark
-    s.buffer_size++;
-  }
-
+  s.prev_micros = curr_micros;
+  s.prev_level = curr_level;
+  s.buffer_write_at = curr_level;
+  s.buffer_read_at = curr_level;
+  s.buffer_size = (this->buffer_size_ + 1) & ~1;  // round up to the nearest even number
   s.buffer = new uint32_t[s.buffer_size];
-  void *buf = (void *) s.buffer;
-  memset(buf, 0, s.buffer_size * sizeof(uint32_t));
-
-  // First index is a space.
-  if (this->pin_->digital_read()) {
-    s.buffer_write_at = s.buffer_read_at = 1;
-  } else {
-    s.buffer_write_at = s.buffer_read_at = 0;
-  }
+  memset((void *) s.buffer, 0, s.buffer_size * sizeof(uint32_t));
   this->pin_->attach_interrupt(RemoteReceiverComponentStore::gpio_intr, &this->store_, gpio::INTERRUPT_ANY_EDGE);
+  this->high_freq_.start();
 }
+
 void RemoteReceiverComponent::dump_config() {
   ESP_LOGCONFIG(TAG, "Remote Receiver:");
   LOG_PIN("  Pin: ", this->pin_);
-  if (this->pin_->digital_read()) {
-    ESP_LOGW(TAG, "Remote Receiver Signal starts with a HIGH value. Usually this means you have to "
-                  "invert the signal using 'inverted: True' in the pin schema!");
-  }
   ESP_LOGCONFIG(TAG,
                 "  Buffer Size: %u\n"
                 "  Tolerance: %u%s\n"
@@ -82,7 +77,7 @@ void RemoteReceiverComponent::loop() {
   if (dist <= 1)
     return;
   const uint32_t now = micros();
-  if (now - s.buffer[write_at] < this->idle_us_) {
+  if (now - s.buffer[write_at] < this->idle_us_ * 2) {
     // The last change was fewer than the configured idle time ago.
     return;
   }
