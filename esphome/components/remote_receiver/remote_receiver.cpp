@@ -81,6 +81,12 @@ void RemoteReceiverComponent::dump_config() {
 void RemoteReceiverComponent::loop() {
   auto &s = this->store_;
 
+  // check for overflow
+  if (s.overflow) {
+    ESP_LOGW(TAG, "Buffer overflow");
+    s.overflow = false;
+  }
+
   // check for data again
   const uint32_t last_index = s.buffer_start;
   if (last_index == s.buffer_read) {
