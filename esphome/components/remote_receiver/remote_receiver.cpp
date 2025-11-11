@@ -11,11 +11,13 @@ namespace remote_receiver {
 static const char *const TAG = "remote_receiver";
 
 void IRAM_ATTR HOT RemoteReceiverComponentStore::gpio_intr(RemoteReceiverComponentStore *arg) {
-  const bool curr_level = arg->pin.digital_read();
+  // invert level so it matches the level of the signal before the edge
+  const bool curr_level = !arg->pin.digital_read();
   const uint32_t curr_micros = micros();
   const bool prev_level = arg->prev_level;
   const uint32_t prev_micros = arg->prev_micros;
 
+  // store prev for next interrupt
   arg->prev_micros = curr_micros;
   arg->prev_level = curr_level;
 
@@ -24,14 +26,29 @@ void IRAM_ATTR HOT RemoteReceiverComponentStore::gpio_intr(RemoteReceiverCompone
     return;
   }
 
-  // commit if prev level is different from last level in the buffer
-  uint32_t buffer_write_at = arg->buffer_write_at + 1;
-  if (buffer_write_at >= arg->buffer_size) {
-    buffer_write_at = 0;
-  }
-  if (prev_level == buffer_write_at % 2) {
-    arg->buffer[buffer_write_at] = prev_micros;
-    arg->buffer_write_at = buffer_write_at;
+  // commit prev if level is different from the last commit level
+  const bool commit_level = arg->commit_level;
+  const uint32_t commit_micros = arg->commit_micros;
+  if (prev_level != commit_level) {
+    uint32_t buffer_write = arg->buffer_write;
+    int32_t delta = std::min(arg->idle_us, prev_micros - commit_micros);
+    int32_t multiplier = ((int32_t) prev_level << 1) - 1;
+    arg->buffer[buffer_write++] = delta * multiplier;
+    if (buffer_write >= arg->buffer_size) {
+      buffer_write = 0;
+    }
+    // check for overflow are reset write pointer if necessary
+    if (buffer_write == arg->buffer_read) {
+      buffer_write = arg->buffer_start;
+      arg->overflow = true;
+    }
+    // start a new sequence if the idle time has been exceeded
+    if (delta >= arg->idle_us) {
+      arg->buffer_start = buffer_write;
+    }
+    arg->buffer_write = buffer_write;
+    arg->commit_micros = prev_micros;
+    arg->commit_level = prev_level;
   }
 }
 
@@ -41,15 +58,19 @@ void RemoteReceiverComponent::setup() {
   uint32_t curr_micros = micros();
   bool curr_level = this->pin_->digital_read();
   auto &s = this->store_;
+  s.idle_us = this->idle_us_;
   s.filter_us = this->filter_us_;
   s.pin = this->pin_->to_isr();
   s.prev_micros = curr_micros;
   s.prev_level = curr_level;
-  s.buffer_write_at = curr_level;
-  s.buffer_read_at = curr_level;
-  s.buffer_size = (this->buffer_size_ + 1) & ~1;  // round up to the nearest even number
-  s.buffer = new uint32_t[s.buffer_size];
-  memset((void *) s.buffer, 0, s.buffer_size * sizeof(uint32_t));
+  s.commit_micros = curr_micros;
+  s.commit_level = curr_level;
+  s.buffer_start = 0;
+  s.buffer_write = 0;
+  s.buffer_read = 0;
+  s.buffer_size = this->buffer_size_;
+  s.buffer = new int32_t[s.buffer_size];
+  memset((void *) s.buffer, 0, s.buffer_size * sizeof(int32_t));
   this->pin_->attach_interrupt(RemoteReceiverComponentStore::gpio_intr, &this->store_, gpio::INTERRUPT_ANY_EDGE);
   this->high_freq_.start();
 }
@@ -70,47 +91,33 @@ void RemoteReceiverComponent::dump_config() {
 void RemoteReceiverComponent::loop() {
   auto &s = this->store_;
 
-  // copy write at to local variables, as it's volatile
-  const uint32_t write_at = s.buffer_write_at;
-  const uint32_t dist = (s.buffer_size + write_at - s.buffer_read_at) % s.buffer_size;
-  // signals must at least one rising and one leading edge
-  if (dist <= 1)
-    return;
-  const uint32_t now = micros();
-  if (now - s.buffer[write_at] < this->idle_us_ * 2) {
-    // The last change was fewer than the configured idle time ago.
+  // check for data again
+  const uint32_t last_index = s.buffer_start;
+  if (last_index == s.buffer_read) {
     return;
   }
 
-  ESP_LOGVV(TAG, "read_at=%u write_at=%u dist=%u now=%u end=%u", s.buffer_read_at, write_at, dist, now,
-            s.buffer[write_at]);
-
-  // Skip first value, it's from the previous idle level
-  s.buffer_read_at = (s.buffer_read_at + 1) % s.buffer_size;
-  uint32_t prev = s.buffer_read_at;
-  s.buffer_read_at = (s.buffer_read_at + 1) % s.buffer_size;
-  const uint32_t reserve_size = 1 + (s.buffer_size + write_at - s.buffer_read_at) % s.buffer_size;
-  this->temp_.clear();
-  this->temp_.reserve(reserve_size);
-  int32_t multiplier = s.buffer_read_at % 2 == 0 ? 1 : -1;
-
-  for (uint32_t i = 0; prev != write_at; i++) {
-    int32_t delta = s.buffer[s.buffer_read_at] - s.buffer[prev];
-    if (uint32_t(delta) >= this->idle_us_) {
-      // already found a space longer than idle. There must have been two pulses
-      break;
+  // find the size of the buffer and reserve the memory
+  uint32_t temp_read = s.buffer_read;
+  uint32_t reserve_size = 0;
+  while (temp_read != last_index && std::abs(s.buffer[temp_read++]) < this->idle_us_) {
+    if (temp_read >= s.buffer_size) {
+      temp_read = 0;
     }
-
-    ESP_LOGVV(TAG, "  i=%u buffer[%u]=%u - buffer[%u]=%u -> %d", i, s.buffer_read_at, s.buffer[s.buffer_read_at], prev,
-              s.buffer[prev], multiplier * delta);
-    this->temp_.push_back(multiplier * delta);
-    prev = s.buffer_read_at;
-    s.buffer_read_at = (s.buffer_read_at + 1) % s.buffer_size;
-    multiplier *= -1;
+    reserve_size++;
   }
-  s.buffer_read_at = (s.buffer_size + s.buffer_read_at - 1) % s.buffer_size;
-  this->temp_.push_back(this->idle_us_ * multiplier);
+  this->temp_.clear();
+  this->temp_.reserve(reserve_size + 1);
 
+  // read the buffer
+  for (uint32_t i = 0; i < reserve_size + 1; i++) {
+    this->temp_.push_back((int32_t) s.buffer[s.buffer_read++]);
+    if (s.buffer_read >= s.buffer_size) {
+      s.buffer_read = 0;
+    }
+  }
+
+  // call the listeners and dumpers
   this->call_listeners_dumpers_();
 }
 
