@@ -54,23 +54,13 @@ void IRAM_ATTR HOT RemoteReceiverComponentStore::gpio_intr(RemoteReceiverCompone
 
 void RemoteReceiverComponent::setup() {
   this->pin_->setup();
-
-  uint32_t curr_micros = micros();
-  bool curr_level = this->pin_->digital_read();
-  auto &s = this->store_;
-  s.idle_us = this->idle_us_;
-  s.filter_us = this->filter_us_;
-  s.pin = this->pin_->to_isr();
-  s.prev_micros = curr_micros;
-  s.prev_level = curr_level;
-  s.commit_micros = curr_micros;
-  s.commit_level = curr_level;
-  s.buffer_start = 0;
-  s.buffer_write = 0;
-  s.buffer_read = 0;
-  s.buffer_size = this->buffer_size_;
-  s.buffer = new int32_t[s.buffer_size];
-  memset((void *) s.buffer, 0, s.buffer_size * sizeof(int32_t));
+  this->store_.idle_us = this->idle_us_;
+  this->store_.filter_us = this->filter_us_;
+  this->store_.pin = this->pin_->to_isr();
+  this->store_.buffer = new int32_t[this->buffer_size_];
+  this->store_.buffer_size = this->buffer_size_;
+  this->store_.prev_micros = this->store_.commit_micros = micros();
+  this->store_.prev_level = this->store_.commit_level = this->pin_->digital_read();
   this->pin_->attach_interrupt(RemoteReceiverComponentStore::gpio_intr, &this->store_, gpio::INTERRUPT_ANY_EDGE);
   this->high_freq_.start();
 }
