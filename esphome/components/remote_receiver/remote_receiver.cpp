@@ -37,7 +37,7 @@ void IRAM_ATTR HOT RemoteReceiverComponentStore::gpio_intr(RemoteReceiverCompone
     if (buffer_write >= arg->buffer_size) {
       buffer_write = 0;
     }
-    // check for overflow are reset write pointer if necessary
+    // check for overflow and reset write pointer if needed
     if (buffer_write == arg->buffer_read) {
       buffer_write = arg->buffer_start;
       arg->overflow = true;
