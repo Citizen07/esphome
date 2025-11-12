@@ -10,6 +10,35 @@ namespace remote_receiver {
 
 static const char *const TAG = "remote_receiver";
 
+static void IRAM_ATTR HOT write_value(RemoteReceiverComponentStore *arg, uint32_t delta, bool level) {
+  // convert level to -1 or +1 and write the delta to the buffer
+  int32_t multiplier = ((int32_t) level << 1) - 1;
+  uint32_t buffer_write = arg->buffer_write;
+  arg->buffer[buffer_write++] = (int32_t) delta * multiplier;
+  if (buffer_write >= arg->buffer_size) {
+    buffer_write = 0;
+  }
+  if (buffer_write == arg->buffer_read) {
+    // overflow detected, reset write pointer
+    buffer_write = arg->buffer_start;
+    arg->overflow = true;
+  }
+  if (delta >= arg->idle_us) {
+    // start a new sequence
+    arg->buffer_start = buffer_write;
+  }
+  arg->buffer_write = buffer_write;
+}
+
+static void IRAM_ATTR HOT commit_value(RemoteReceiverComponentStore *arg, uint32_t micros, bool level) {
+  // commit value if level is different from the last commit level
+  if (level != arg->commit_level) {
+    write_value(arg, micros - arg->commit_micros, level);
+    arg->commit_micros = micros;
+    arg->commit_level = level;
+  }
+}
+
 void IRAM_ATTR HOT RemoteReceiverComponentStore::gpio_intr(RemoteReceiverComponentStore *arg) {
   // invert level so it matches the level of the signal before the edge
   const bool curr_level = !arg->pin.digital_read();
@@ -17,39 +46,12 @@ void IRAM_ATTR HOT RemoteReceiverComponentStore::gpio_intr(RemoteReceiverCompone
   const bool prev_level = arg->prev_level;
   const uint32_t prev_micros = arg->prev_micros;
 
-  // store prev for next interrupt
+  // commit prev if level is different from the last commit level and the filter time has been exceeded
+  if (curr_micros - prev_micros >= arg->filter_us && prev_level != curr_level) {
+    commit_value(arg, prev_micros, prev_level);
+  }
   arg->prev_micros = curr_micros;
   arg->prev_level = curr_level;
-
-  // filter out short pulses or if the level is the same
-  if (curr_micros - prev_micros < arg->filter_us || prev_level == curr_level) {
-    return;
-  }
-
-  // commit prev if level is different from the last commit level
-  const bool commit_level = arg->commit_level;
-  const uint32_t commit_micros = arg->commit_micros;
-  if (prev_level != commit_level) {
-    uint32_t buffer_write = arg->buffer_write;
-    int32_t delta = std::min(arg->idle_us, prev_micros - commit_micros);
-    int32_t multiplier = ((int32_t) prev_level << 1) - 1;
-    arg->buffer[buffer_write++] = delta * multiplier;
-    if (buffer_write >= arg->buffer_size) {
-      buffer_write = 0;
-    }
-    // check for overflow and reset write pointer if needed
-    if (buffer_write == arg->buffer_read) {
-      buffer_write = arg->buffer_start;
-      arg->overflow = true;
-    }
-    // start a new sequence if the idle time has been exceeded
-    if (delta >= arg->idle_us) {
-      arg->buffer_start = buffer_write;
-    }
-    arg->buffer_write = buffer_write;
-    arg->commit_micros = prev_micros;
-    arg->commit_level = prev_level;
-  }
 }
 
 void RemoteReceiverComponent::setup() {
@@ -79,16 +81,28 @@ void RemoteReceiverComponent::dump_config() {
 }
 
 void RemoteReceiverComponent::loop() {
-  auto &s = this->store_;
-
   // check for overflow
+  auto &s = this->store_;
   if (s.overflow) {
     ESP_LOGW(TAG, "Buffer overflow");
     s.overflow = false;
   }
 
-  // check for data again
-  const uint32_t last_index = s.buffer_start;
+  // check for data
+  uint32_t last_index = s.buffer_start;
+  if (last_index == s.buffer_read) {
+    // check for data stuck in the buffer and commit the previous value if needed
+    InterruptLock lock;
+    if (s.buffer_read == s.buffer_start && s.buffer_write != s.buffer_start &&
+        micros() - s.prev_micros >= this->idle_us_) {
+      // commit the previous value
+      commit_value(&s, s.prev_micros, s.prev_level);
+      // write idle unless its already the start of a new sequence
+      if (s.buffer_write != s.buffer_start) {
+        write_value(&s, s.idle_us, !s.prev_level);
+      }
+    }
+  }
   if (last_index == s.buffer_read) {
     return;
   }
