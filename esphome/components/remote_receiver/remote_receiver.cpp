@@ -103,7 +103,7 @@ void RemoteReceiverComponent::loop() {
     if (s.buffer_read == s.buffer_start && s.buffer_write != s.buffer_start &&
         micros() - s.prev_micros >= this->idle_us_) {
       commit_value(&s, s.prev_micros, s.prev_level);
-      write_value(&s, s.idle_us, !s.prev_level);
+      write_value(&s, s.idle_us, !s.commit_level);
       last_index = s.buffer_start;
     }
   }
