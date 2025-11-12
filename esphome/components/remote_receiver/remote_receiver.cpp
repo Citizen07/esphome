@@ -18,14 +18,21 @@ static void IRAM_ATTR HOT write_value(RemoteReceiverComponentStore *arg, uint32_
   if (buffer_write >= arg->buffer_size) {
     buffer_write = 0;
   }
+
+  // detect overflow and reset write pointer
   if (buffer_write == arg->buffer_read) {
-    // overflow detected, reset write pointer
     buffer_write = arg->buffer_start;
     arg->overflow = true;
   }
+
+  // detect idle and start a new sequence unless there is only idle in
+  // which case reset write pointer instead
   if (delta >= arg->idle_us) {
-    // start a new sequence
-    arg->buffer_start = buffer_write;
+    if (arg->buffer_write == arg->buffer_start) {
+      buffer_write = arg->buffer_start;
+    } else {
+      arg->buffer_start = buffer_write;
+    }
   }
   arg->buffer_write = buffer_write;
 }
@@ -46,7 +53,7 @@ void IRAM_ATTR HOT RemoteReceiverComponentStore::gpio_intr(RemoteReceiverCompone
   const bool prev_level = arg->prev_level;
   const uint32_t prev_micros = arg->prev_micros;
 
-  // commit prev if level is different from the last commit level and the filter time has been exceeded
+  // commit prev if pulse not filtered and the level is different
   if (curr_micros - prev_micros >= arg->filter_us && prev_level != curr_level) {
     commit_value(arg, prev_micros, prev_level);
   }
@@ -88,19 +95,16 @@ void RemoteReceiverComponent::loop() {
     s.overflow = false;
   }
 
-  // check for data
+  // if no data is available, check for data stuck in the buffer and commit the
+  // previous value if needed
   uint32_t last_index = s.buffer_start;
   if (last_index == s.buffer_read) {
-    // check for data stuck in the buffer and commit the previous value if needed
     InterruptLock lock;
     if (s.buffer_read == s.buffer_start && s.buffer_write != s.buffer_start &&
         micros() - s.prev_micros >= this->idle_us_) {
-      // commit the previous value
       commit_value(&s, s.prev_micros, s.prev_level);
-      // write idle unless its already the start of a new sequence
-      if (s.buffer_write != s.buffer_start) {
-        write_value(&s, s.idle_us, !s.prev_level);
-      }
+      write_value(&s, s.idle_us, !s.prev_level);
+      last_index = s.buffer_start;
     }
   }
   if (last_index == s.buffer_read) {
